@@ -48,6 +48,18 @@ struct Session {
     username: Option<String>,
 }
 
+impl Session {
+    fn authed(&self) -> Result<&str, ws::Error> {
+        match self.username {
+            Some(ref username) => Ok(username),
+            None => {
+                let _ = self.out.send(Outbound::NotAuthed);
+                Err(ws::Error::new(ws::ErrorKind::Internal, "NotAuthed"))
+            }
+        }
+    }
+}
+
 impl Handler for Session {
     fn on_close(&mut self, _code: ws::CloseCode, _reason: &str) {
         if let Some(ref username) = self.username {
@@ -99,114 +111,100 @@ impl Handler for Session {
                 self.out.send(Outbound::Success)
             }
 
-            Join { channel } => match self.username {
-                Some(ref username) => {
-                    send_to_channel(
-                        channel.clone(),
-                        Outbound::Joined {
-                            username,
-                            channel: &channel,
-                        },
-                    );
+            Join { channel } => {
+                let username = self.authed()?;
+                send_to_channel(
+                    channel.clone(),
+                    Outbound::Joined {
+                        username,
+                        channel: &channel,
+                    },
+                );
 
-                    USERS
-                        .write()
-                        .unwrap()
-                        .get_mut(username)
-                        .unwrap()
-                        .channels
-                        .insert(channel.clone());
+                USERS
+                    .write()
+                    .unwrap()
+                    .get_mut(username)
+                    .unwrap()
+                    .channels
+                    .insert(channel.clone());
 
-                    CHANNELS
-                        .write()
-                        .unwrap()
-                        .entry(channel)
-                        .or_insert_with(|| HashSet::new())
-                        .insert(username.clone());
+                CHANNELS
+                    .write()
+                    .unwrap()
+                    .entry(channel)
+                    .or_insert_with(|| HashSet::new())
+                    .insert(username.to_string());
 
-                    self.out.send(Outbound::Success)
-                }
+                self.out.send(Outbound::Success)
+            }
 
-                None => self.out.send(Outbound::NotAuthed),
-            },
+            Leave { channel } => {
+                let username = self.authed()?;
+                send_to_channel(
+                    channel.clone(),
+                    Outbound::Left {
+                        username,
+                        channel: &channel,
+                    },
+                );
 
-            Leave { channel } => match self.username {
-                Some(ref username) => {
-                    send_to_channel(
-                        channel.clone(),
-                        Outbound::Left {
-                            username,
-                            channel: &channel,
-                        },
-                    );
+                USERS
+                    .write()
+                    .unwrap()
+                    .get_mut(username)
+                    .unwrap()
+                    .channels
+                    .remove(&channel);
 
-                    USERS
-                        .write()
-                        .unwrap()
-                        .get_mut(username)
-                        .unwrap()
-                        .channels
-                        .remove(&channel);
+                CHANNELS
+                    .write()
+                    .unwrap()
+                    .entry(channel)
+                    .or_insert_with(|| HashSet::new())
+                    .remove(username);
 
-                    CHANNELS
-                        .write()
-                        .unwrap()
-                        .entry(channel)
-                        .or_insert_with(|| HashSet::new())
-                        .remove(username);
+                self.out.send(Outbound::Success)
+            }
 
-                    self.out.send(Outbound::Success)
-                }
-
-                None => self.out.send(Outbound::NotAuthed),
-            },
-
-            ChannelInfo { channel } => match self.username {
-                Some(_) => {
-                    if let Some(members) = CHANNELS.read().unwrap().get(&channel) {
-                        self.out.send(Outbound::ChannelInfo {
-                            members: members.iter().map(|x| x.as_str()).collect(),
-                        })
-                    } else {
-                        self.out.send(Outbound::NoSuchChannel)
-                    }
-                }
-
-                None => self.out.send(Outbound::NotAuthed),
-            },
-
-            JoinedChannels => match self.username {
-                Some(ref username) => {
-                    let users = USERS.read().unwrap();
-                    let user = users.get(username).unwrap();
-                    self.out.send(Outbound::Channels {
-                        channels: user.channels
-                            .iter()
-                            .map(|channel| channel.as_str())
-                            .collect(),
+            ChannelInfo { channel } => {
+                let _ = self.authed()?;
+                if let Some(members) = CHANNELS.read().unwrap().get(&channel) {
+                    self.out.send(Outbound::ChannelInfo {
+                        members: members.iter().map(|x| x.as_str()).collect(),
                     })
+                } else {
+                    self.out.send(Outbound::NoSuchChannel)
                 }
+            }
 
-                None => self.out.send(Outbound::NotAuthed),
-            },
+            JoinedChannels => {
+                let username = self.authed()?;
+                let users = USERS.read().unwrap();
+                let user = users.get(username).unwrap();
+                self.out.send(Outbound::Channels {
+                    channels: user.channels
+                        .iter()
+                        .map(|channel| channel.as_str())
+                        .collect(),
+                })
+            }
 
-            AllChannels => match self.username {
-                Some(_) => {
-                    let channels = CHANNELS.read().unwrap();
+            AllChannels => {
+                let _ = self.authed()?;
+                let channels = CHANNELS.read().unwrap();
 
-                    self.out.send(Outbound::Channels {
-                        channels: channels
-                            .iter()
-                            .map(|(channel, _)| channel.as_str())
-                            .collect(),
-                    })
-                }
+                self.out.send(Outbound::Channels {
+                    channels: channels
+                        .iter()
+                        .map(|(channel, _)| channel.as_str())
+                        .collect(),
+                })
+            }
 
-                None => self.out.send(Outbound::NotAuthed),
-            },
-
-            Message { channel, text } => match self.username {
-                Some(ref username) => match CHANNELS.read().unwrap().get(&channel) {
+            Message { channel, text } => {
+                let username = self.authed()?;
+                match CHANNELS.read().unwrap().get(&channel) {
                     Some(members) if members.contains(username) => {
                         send_to_channel(
                             channel.clone(),
@@ -221,10 +219,8 @@ impl Handler for Session {
                     }
 
                     _ => self.out.send(Outbound::NotInChannel),
-                },
-
-                None => self.out.send(Outbound::NotAuthed),
-            },
+                }
+            }
         }
     }
 }
