@@ -21,38 +21,19 @@ lazy_static! {
     static ref CHANNELS: RwLock<HashMap<String, HashSet<String>>> = RwLock::new(HashMap::new());
 }
 
-#[derive(Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
-enum Inbound {
-    Logout,
-    Login { username: String, password: String },
-    Join { channel: String },
-    Message { channel: String, text: String },
-}
+mod messages;
+use messages::*;
 
-#[derive(Serialize, Debug, Clone)]
-#[serde(tag = "type")]
-enum Outbound {
-    Success,
-    AuthFail,
-    NotAuthed,
-    Joined {
-        channel: String,
-        username: String,
-    },
-    Message {
-        channel: String,
-        username: String,
-        text: String,
-    },
-    FormatError {
-        error: String,
-    },
-}
+fn send_to_channel(channel: String, message: Outbound) {
+    let channels = CHANNELS.read().unwrap();
 
-impl Into<ws::Message> for Outbound {
-    fn into(self) -> ws::Message {
-        ws::Message::Text(serde_json::to_string(&self).unwrap())
+    if channels.contains_key(&channel) {
+        let sockets = SOCKETS.read().unwrap();
+        for user in channels.get(&channel).unwrap() {
+            sockets.get(user).map(|socket| {
+                let _ = socket.send(message.clone());
+            });
+        }
     }
 }
 
@@ -85,53 +66,41 @@ impl Handler for Session {
                 self.username = None;
                 self.out.send(Outbound::Success)
             }
+
             Login { username, password } => {
                 // ensure the user is logged out
                 self.username = None;
 
-                // only hold the write lock for a short time
-                {
-                    let mut users = USERS.write().unwrap();
-                    if users.contains_key(&username) {
-                        if users.get(&username).unwrap() != &password {
-                            return self.out.send(Outbound::AuthFail);
-                        }
-                    } else {
-                        users.insert(username.clone(), password);
+                let mut users = USERS.write().unwrap();
+                if users.contains_key(&username) {
+                    if users.get(&username).unwrap() != &password {
+                        return self.out.send(Outbound::AuthFail);
                     }
+                } else {
+                    users.insert(username.clone(), password);
                 }
 
                 let mut sockets = SOCKETS.write().unwrap();
                 self.username = Some(username.clone());
                 sockets.insert(username, self.out.clone());
+
                 self.out.send(Outbound::Success)
             }
 
             Join { channel } => match self.username {
                 Some(ref username) => {
-                    // ensure the read lock will get dropped before the write lock opens
-                    {
-                        let mut channels = CHANNELS.read().unwrap();
-
-                        if channels.contains_key(&channel) {
-                            let joined = Outbound::Joined {
-                                channel: channel.clone(),
-                                username: username.clone(),
-                            };
-
-                            let mut sockets = SOCKETS.read().unwrap();
-                            for user in channels.get(&channel).unwrap() {
-                                sockets.get(user).map(|socket| {
-                                    let _ = socket.send(joined.clone());
-                                });
-                            }
-                        }
-                    }
+                    send_to_channel(
+                        channel.clone(),
+                        Outbound::Joined {
+                            channel: channel.clone(),
+                            username: username.clone(),
+                        },
+                    );
 
                     CHANNELS
                         .write()
                         .unwrap()
-                        .entry(channel.clone())
+                        .entry(channel)
                         .or_insert_with(|| HashSet::new())
                         .insert(username.clone());
 
@@ -142,26 +111,22 @@ impl Handler for Session {
             },
 
             Message { channel, text } => match self.username {
-                Some(ref username) => {
-                    let mut channels = CHANNELS.read().unwrap();
+                Some(ref username) => match CHANNELS.read().unwrap().get(&channel) {
+                    Some(members) if members.contains(username) => {
+                        send_to_channel(
+                            channel.clone(),
+                            Outbound::Message {
+                                channel: channel,
+                                username: username.clone(),
+                                text: text,
+                            },
+                        );
 
-                    if channels.contains_key(&channel) {
-                        let message = Outbound::Message {
-                            channel: channel.clone(),
-                            username: username.clone(),
-                            text: text,
-                        };
-
-                        let mut sockets = SOCKETS.read().unwrap();
-                        for user in channels.get(&channel).unwrap() {
-                            sockets.get(user).map(|socket| {
-                                let _ = socket.send(message.clone());
-                            });
-                        }
+                        self.out.send(Outbound::Success)
                     }
 
-                    self.out.send(Outbound::Success)
-                }
+                    _ => self.out.send(Outbound::NotInChannel),
+                },
 
                 None => self.out.send(Outbound::NotAuthed),
             },
