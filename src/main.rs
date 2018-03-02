@@ -15,9 +15,15 @@ use ws::{listen, Handler, Sender};
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
+#[derive(Clone, PartialEq)]
+struct User {
+    password: String,
+    channels: HashSet<String>,
+}
+
 lazy_static! {
     static ref SOCKETS: RwLock<HashMap<String, Sender>> =  RwLock::new(HashMap::new());
-    static ref USERS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::new());
+    static ref USERS: RwLock<HashMap<String, User>> = RwLock::new(HashMap::new());
     static ref CHANNELS: RwLock<HashMap<String, HashSet<String>>> = RwLock::new(HashMap::new());
 }
 
@@ -55,7 +61,7 @@ impl Handler for Session {
             Ok(msg) => msg,
             Err(err) => {
                 return self.out.send(Outbound::FormatError {
-                    error: format!("{:?}", err),
+                    error: &format!("{:?}", err),
                 })
             }
         };
@@ -73,11 +79,17 @@ impl Handler for Session {
 
                 let mut users = USERS.write().unwrap();
                 if users.contains_key(&username) {
-                    if users.get(&username).unwrap() != &password {
+                    if users.get(&username).unwrap().password != password {
                         return self.out.send(Outbound::AuthFail);
                     }
                 } else {
-                    users.insert(username.clone(), password);
+                    users.insert(
+                        username.clone(),
+                        User {
+                            password,
+                            channels: HashSet::new(),
+                        },
+                    );
                 }
 
                 let mut sockets = SOCKETS.write().unwrap();
@@ -92,10 +104,18 @@ impl Handler for Session {
                     send_to_channel(
                         channel.clone(),
                         Outbound::Joined {
-                            channel: channel.clone(),
-                            username: username.clone(),
+                            username,
+                            channel: &channel,
                         },
                     );
+
+                    USERS
+                        .write()
+                        .unwrap()
+                        .get_mut(username)
+                        .unwrap()
+                        .channels
+                        .insert(channel.clone());
 
                     CHANNELS
                         .write()
@@ -110,15 +130,90 @@ impl Handler for Session {
                 None => self.out.send(Outbound::NotAuthed),
             },
 
+            Leave { channel } => match self.username {
+                Some(ref username) => {
+                    send_to_channel(
+                        channel.clone(),
+                        Outbound::Left {
+                            username,
+                            channel: &channel,
+                        },
+                    );
+
+                    USERS
+                        .write()
+                        .unwrap()
+                        .get_mut(username)
+                        .unwrap()
+                        .channels
+                        .remove(&channel);
+
+                    CHANNELS
+                        .write()
+                        .unwrap()
+                        .entry(channel)
+                        .or_insert_with(|| HashSet::new())
+                        .remove(username);
+
+                    self.out.send(Outbound::Success)
+                }
+
+                None => self.out.send(Outbound::NotAuthed),
+            },
+
+            ChannelInfo { channel } => match self.username {
+                Some(_) => {
+                    if let Some(members) = CHANNELS.read().unwrap().get(&channel) {
+                        self.out.send(Outbound::ChannelInfo {
+                            members: members.iter().map(|x| x.as_str()).collect(),
+                        })
+                    } else {
+                        self.out.send(Outbound::NoSuchChannel)
+                    }
+                }
+
+                None => self.out.send(Outbound::NotAuthed),
+            },
+
+            JoinedChannels => match self.username {
+                Some(ref username) => {
+                    let users = USERS.read().unwrap();
+                    let user = users.get(username).unwrap();
+                    self.out.send(Outbound::Channels {
+                        channels: user.channels
+                            .iter()
+                            .map(|channel| channel.as_str())
+                            .collect(),
+                    })
+                }
+
+                None => self.out.send(Outbound::NotAuthed),
+            },
+
+            AllChannels => match self.username {
+                Some(_) => {
+                    let channels = CHANNELS.read().unwrap();
+
+                    self.out.send(Outbound::Channels {
+                        channels: channels
+                            .iter()
+                            .map(|(channel, _)| channel.as_str())
+                            .collect(),
+                    })
+                }
+
+                None => self.out.send(Outbound::NotAuthed),
+            },
+
             Message { channel, text } => match self.username {
                 Some(ref username) => match CHANNELS.read().unwrap().get(&channel) {
                     Some(members) if members.contains(username) => {
                         send_to_channel(
                             channel.clone(),
                             Outbound::Message {
-                                channel: channel,
-                                username: username.clone(),
-                                text: text,
+                                username,
+                                channel: &channel,
+                                text: &text,
                             },
                         );
 
